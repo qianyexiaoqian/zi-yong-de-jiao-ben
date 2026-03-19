@@ -1,5 +1,5 @@
 #!/bin/bash
-# Xboard 完整管理脚本 v1.4
+# Xboard 完整管理脚本 v1.5
 # 作者: qianye
 # 功能: 部署、升级、卸载、配置管理
 # 优化: 支持退格删除、输入修改、输入验证、密码安全处理
@@ -234,7 +234,7 @@ show_logo() {
     echo -e "${BLUE}"
     cat << "EOF"
 ╔═══════════════════════════════════════════════════════════════╗
-║   Xboard Docker 管理脚本 v1.4                                 ║
+║   Xboard Docker 管理脚本 v1.5                                 ║
 ║   作者: qianye                                                ║
 ║   让人人都有机会成为坤场主，拒绝炒鸡，做一个合格的MJJ。       ║
 ╚═══════════════════════════════════════════════════════════════╝
@@ -528,18 +528,41 @@ patch_compose_volumes() {
         return 1
     fi
 
+    # 自适应缩进：从锚点行提取实际缩进前缀（兼容不同空格/tab 风格）
+    local indent_prefix
+    indent_prefix=$(grep -m1 -F "$anchor" "$compose_file" | sed "s|${anchor}.*||")
+    # indent_prefix 现在包含锚点行 "- ./plugins..." 前面的全部空白
+
+    # 修改前备份，以便验证失败时回滚
+    cp "$compose_file" "${compose_file}.patch_bak"
+
     for mapping in "${required_mappings[@]}"; do
         if ! grep -qF "$mapping" "$compose_file"; then
-            # 在 ./plugins:/www/plugins 行后面插入缺失的映射
-            sed -i "\\|${anchor}|a\\      - ${mapping}" "$compose_file"
+            # 使用与锚点行相同的缩进前缀追加映射
+            sed -i "\\|${anchor}|a\\${indent_prefix}- ${mapping}" "$compose_file"
             print_info "  补充映射: $mapping"
             patched=true
         fi
     done
 
     if [ "$patched" = "true" ]; then
-        print_success "$compose_basename 已自动补充缺失的目录映射"
+        # 验证修改后的 YAML 语法是否正确
+        if docker compose -f "$compose_file" config > /dev/null 2>&1; then
+            rm -f "${compose_file}.patch_bak"
+            print_success "$compose_basename 已自动补充缺失的目录映射"
+        else
+            print_error "补丁后 YAML 语法校验失败，正在回滚..."
+            mv "${compose_file}.patch_bak" "$compose_file"
+            print_warning "已回滚到补丁前状态，请手动添加以下映射:"
+            for mapping in "${required_mappings[@]}"; do
+                if ! grep -qF "$mapping" "$compose_file"; then
+                    echo "      - $mapping"
+                fi
+            done
+            return 1
+        fi
     else
+        rm -f "${compose_file}.patch_bak"
         print_success "$compose_basename 映射已是最新，无需补充"
     fi
 }
@@ -840,7 +863,8 @@ upgrade_xboard() {
     cd "$INSTALL_DIR"
 
     if read_confirm "是否先备份数据？" "y"; then
-        backup_data "upgrade_backup_$(date +%Y%m%d_%H%M%S)" "silent"
+        # 传入 no_restart 参数：备份后不重启服务，避免升级过程中无谓的 停→启→停 抖动
+        backup_data "upgrade_backup_$(date +%Y%m%d_%H%M%S)" "silent" "no_restart"
     fi
 
     print_step "拉取最新镜像..."
@@ -852,9 +876,10 @@ upgrade_xboard() {
     fi
 
     # 升级前从旧容器提取未映射的自定义文件（防止数据丢失）
+    # 注意：必须在 stop 之前获取容器ID（运行中的容器，docker cp 也支持已停止的容器）
     print_step "检查并提取旧容器中未映射的自定义文件..."
     local web_container
-    web_container=$(docker compose ps -q web 2>/dev/null)
+    web_container=$(docker compose ps -aq web 2>/dev/null)
     if [ -n "$web_container" ]; then
         for dir in resources public/theme public/assets storage/framework; do
             if [ ! -d "$INSTALL_DIR/$dir" ] || [ -z "$(ls -A "$INSTALL_DIR/$dir" 2>/dev/null)" ]; then
@@ -865,8 +890,10 @@ upgrade_xboard() {
         done
     fi
 
+    # 使用 stop 而非 down：只停止容器不删除，更安全（保留容器状态便于排查）
+    # 后续 docker compose up -d 会自动检测镜像更新并重建容器
     print_step "停止旧服务..."
-    docker compose down
+    docker compose stop
 
     # 同步 resources 目录（只复制新文件，不覆盖已存在的文件）
     print_step "同步 resources 目录..."
@@ -1165,9 +1192,13 @@ backup_data() {
     tar -czf "$backup_dir/data.tar.gz" .docker/.data 2>/dev/null || true
 
     # 检测并备份 Docker named volume 中的 Redis 数据（官方 compose.yaml 使用 named volume）
-    if docker volume inspect redis-data &>/dev/null; then
-        print_step "检测到 Redis named volume，额外备份..."
-        docker run --rm -v redis-data:/data -v "$backup_dir":/backup \
+    # Docker Compose v2 创建的 named volume 带项目前缀，如 xboard_redis-data
+    # 需要动态查找而非硬编码名称
+    local redis_vol
+    redis_vol=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep 'redis-data$' | head -1)
+    if [ -n "$redis_vol" ]; then
+        print_step "检测到 Redis named volume ($redis_vol)，额外备份..."
+        docker run --rm -v "$redis_vol":/data -v "$backup_dir":/backup \
             alpine tar czf /backup/redis-volume.tar.gz -C / data 2>/dev/null || true
         print_success "Redis named volume 已备份 (redis-volume.tar.gz)"
     fi
@@ -1182,9 +1213,13 @@ backup_data() {
     tar -czf "$backup_dir/plugins.tar.gz" plugins 2>/dev/null || true
     tar -czf "$backup_dir/public.tar.gz" public/theme public/assets 2>/dev/null || true
 
-    # 重新启动服务
-    print_step "重新启动服务..."
-    docker compose up -d 2>/dev/null || true
+    # 重新启动服务（第3个参数为 no_restart 时跳过，用于升级场景避免无谓抖动）
+    if [ "$3" != "no_restart" ]; then
+        print_step "重新启动服务..."
+        docker compose up -d 2>/dev/null || true
+    else
+        print_info "跳过重启（后续流程将负责启动服务）"
+    fi
 
     print_success "备份完成: $backup_dir"
     echo ""
@@ -1279,6 +1314,29 @@ restore_data() {
     tar -xzf "$backup_dir/resources.tar.gz" -C ./ 2>/dev/null || true
     tar -xzf "$backup_dir/plugins.tar.gz" -C ./ 2>/dev/null || true
     tar -xzf "$backup_dir/public.tar.gz" -C ./ 2>/dev/null || true
+
+    # 恢复 Redis named volume 数据（如果备份中包含）
+    if [ -f "$backup_dir/redis-volume.tar.gz" ]; then
+        print_step "恢复 Redis named volume 数据..."
+        local redis_vol
+        redis_vol=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep 'redis-data$' | head -1)
+        if [ -n "$redis_vol" ]; then
+            docker run --rm -v "$redis_vol":/data -v "$backup_dir":/backup \
+                alpine sh -c 'cd / && tar xzf /backup/redis-volume.tar.gz' 2>/dev/null || true
+            print_success "Redis named volume 数据已恢复"
+        else
+            # named volume 不存在时尝试创建后恢复（适用于全新环境恢复场景）
+            print_info "未找到现有 Redis named volume，尝试创建并恢复..."
+            # 从 compose 配置中读取 volume 名称前缀
+            local project_name
+            project_name=$(basename "$INSTALL_DIR" | tr '[:upper:]' '[:lower:]')
+            local vol_name="${project_name}_redis-data"
+            docker volume create "$vol_name" 2>/dev/null || true
+            docker run --rm -v "$vol_name":/data -v "$backup_dir":/backup \
+                alpine sh -c 'cd / && tar xzf /backup/redis-volume.tar.gz' 2>/dev/null || true
+            print_success "Redis named volume ($vol_name) 已创建并恢复数据"
+        fi
+    fi
 
     # 自动补丁: 恢复的 compose.yaml 可能是旧版格式，检测并补充缺失映射
     print_step "检查 compose.yaml 目录映射..."
